@@ -641,6 +641,53 @@ class BlackTestCase(BlackBaseTestCase):
             )
             self.assertNotIn(b"\r\r\n", result.stdout_bytes)
 
+    def test_skip_source_first_line_with_line_ranges(self) -> None:
+        source = "not a Python header\nx=1\ny=2\n"
+        with TemporaryDirectory() as workspace:
+            test_file = Path(workspace) / "test.py"
+            test_file.write_text(source, encoding="utf-8")
+            result = BlackRunner().invoke(
+                black.main,
+                [
+                    str(test_file),
+                    "-x",
+                    "--line-ranges=2-2",
+                    f"--config={EMPTY_CONFIG}",
+                ],
+            )
+            self.assertEqual(result.exit_code, 0)
+            expected = "not a Python header\nx = 1\ny=2\n"
+            self.assertEqual(test_file.read_text(encoding="utf-8"), expected)
+
+    def test_skip_source_first_line_with_line_ranges_header_only(self) -> None:
+        source = "not a Python header\nx=1\ny=2\n"
+        with TemporaryDirectory() as workspace:
+            test_file = Path(workspace) / "test.py"
+            test_file.write_text(source, encoding="utf-8")
+            result = BlackRunner().invoke(
+                black.main,
+                [
+                    str(test_file),
+                    "-x",
+                    "--line-ranges=1-1",
+                    f"--config={EMPTY_CONFIG}",
+                ],
+            )
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(test_file.read_text(encoding="utf-8"), source)
+
+    def test_skip_source_first_line_with_line_ranges_via_stdin(self) -> None:
+        for nl in ["\n", "\r\n"]:
+            code = nl.join(["not a Python header", "x=1", "y=2", ""])
+            expected = nl.join(["not a Python header", "x = 1", "y=2", ""])
+            result = BlackRunner().invoke(
+                black.main,
+                ["-", "-x", "--line-ranges=2-2", f"--config={EMPTY_CONFIG}"],
+                input=BytesIO(code.encode()),
+            )
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.stdout_bytes, expected.encode())
+
     def test_skip_magic_trailing_comma(self) -> None:
         source, _ = read_data("cases", "expression")
         expected, _ = read_data(

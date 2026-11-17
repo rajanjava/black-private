@@ -1052,6 +1052,17 @@ def reformat_one(
         report.failed(src, exc)
 
 
+def _shift_lines_for_skipped_header(
+    lines: Collection[tuple[int, int]],
+) -> Collection[tuple[int, int]]:
+    shifted_lines: list[tuple[int, int]] = []
+    for start, end in lines:
+        if end <= 1:
+            continue
+        shifted_lines.append((max(1, start - 1), end - 1))
+    return shifted_lines
+
+
 def format_file_in_place(
     src: Path,
     fast: bool,
@@ -1078,6 +1089,10 @@ def format_file_in_place(
         if mode.skip_source_first_line:
             header = buf.readline()
         src_contents, encoding, newline = decode_bytes(buf.read(), mode)
+    if mode.skip_source_first_line and header and lines:
+        lines = _shift_lines_for_skipped_header(lines)
+        if not lines:
+            return False
     try:
         dst_contents = format_file_contents(
             src_contents, fast=fast, mode=mode, lines=lines
@@ -1141,6 +1156,7 @@ def format_stdin_to_stdout(
     then = datetime.now(timezone.utc)
 
     header_str = ""
+    header = b""
     if content is None:
         buf = io.BytesIO(sys.stdin.buffer.read())
         header = buf.readline() if mode.skip_source_first_line else b""
@@ -1155,6 +1171,10 @@ def format_stdin_to_stdout(
 
     dst = src
     try:
+        if mode.skip_source_first_line and header and lines:
+            lines = _shift_lines_for_skipped_header(lines)
+            if not lines:
+                raise NothingChanged
         dst = format_file_contents(src, fast=fast, mode=mode, lines=lines)
         return True
 
