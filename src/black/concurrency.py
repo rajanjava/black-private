@@ -1,0 +1,291 @@
+"""
+Formatting many files at once via multiprocessing. Contains entrypoint and utilities.
+
+NOTE: this module is only imported if we need to format several files at once.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import signal
+import sys
+import tempfile
+import traceback
+from collections.abc import Iterable
+from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
+from multiprocessing import Manager
+from pathlib import Path
+from typing import Any
+
+import click
+from mypy_extensions import mypyc_attr
+
+from black import WriteBack, format_file_in_place
+from black.cache import Cache
+from black.mode import Mode
+from black.output import err
+from black.report import Changed, Report
+
+
+def maybe_use_uvloop() -> asyncio.AbstractEventLoop:
+    """If our environment has uvloop or winloop installed we use it otherwise
+    a normal asyncio eventloop is called as fallback.
+
+    This is called only from command-line entry points to avoid
+    interfering with the parent process if Black is used as a library.
+    """
+    try:
+        if sys.platform != "win32":
+            import uvloop
+
+            return uvloop.new_event_loop()
+        else:
+            import winloop
+
+            return winloop.new_event_loop()
+    except ImportError:
+        return asyncio.new_event_loop()
+
+
+def cancel(tasks: Iterable[asyncio.Future[Any]]) -> None:
+    """asyncio signal handler that cancels all `tasks` and reports to stderr."""
+    err("Aborting...")
+    for task in tasks:
+        task.cancel()
+
+
+def shutdown(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel all pending tasks on `loop`, wait for them, and close the loop."""
+    try:
+        # This part is borrowed from asyncio/runners.py in Python 3.7b2.
+        to_cancel = [task for task in asyncio.all_tasks(loop) if not task.done()]
+        if not to_cancel:
+            return
+
+        for task in to_cancel:
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
+    finally:
+        # `concurrent.futures.Future` objects cannot be cancelled once they
+        # are already running. There might be some when the `shutdown()` happened.
+        # Silence their logger's spew about the event loop being closed.
+        cf_logger = logging.getLogger("concurrent.futures")
+        cf_logger.setLevel(logging.CRITICAL)
+        loop.close()
+
+
+def cap_process_pool_workers(workers: int) -> int:
+    if sys.platform == "win32":
+        # Work around https://bugs.python.org/issue26903
+        workers = min(workers, 60)
+    return workers
+
+
+# diff-shades depends on being to monkeypatch this function to operate. I know it's
+# not ideal, but this shouldn't cause any issues ... hopefully. ~ichard26
+@mypyc_attr(patchable=True)
+def reformat_many(
+    sources: set[Path],
+    fast: bool,
+    write_back: WriteBack,
+    mode: Mode,
+    report: Report,
+    workers: int | None,
+    no_cache: bool = False,
+    cache_dir: Path | None = None,
+) -> None:
+    """Reformat multiple files using a ProcessPoolExecutor."""
+
+    if workers is None:
+        workers_value = os.environ.get("BLACK_NUM_WORKERS")
+        if workers_value is not None:
+            try:
+                workers = int(workers_value)
+            except ValueError:
+                raise click.BadParameter(
+                    f"{workers_value!r} is not a valid integer",
+                    param_hint="BLACK_NUM_WORKERS",
+                ) from None
+            if workers < 1:
+                raise click.BadParameter(
+                    f"{workers_value!r} is not in the range x>=1",
+                    param_hint="BLACK_NUM_WORKERS",
+                )
+        else:
+            workers = os.cpu_count() or 1
+    workers = cap_process_pool_workers(workers)
+    if getattr(sys, "frozen", False):
+        # In frozen builds (e.g. PyInstaller), avoid spawning worker processes (i.e.
+        # avoid using ProcessPoolExecutor) to prevent shutdown errors when workers
+        # try to import modules after cleanup begins.
+        # See https://github.com/psf/black/issues/4823
+        workers = 1
+
+    executor: Executor | None = None
+    if workers > 1:
+        try:
+            executor = ProcessPoolExecutor(max_workers=workers)
+        except (ImportError, NotImplementedError, OSError):
+            # we arrive here if the underlying system does not support multi-processing
+            # like in AWS Lambda or Termux, in which case we gracefully fallback to
+            # a ThreadPoolExecutor with just a single worker (more workers would not do
+            # us any good due to the Global Interpreter Lock)
+            pass
+
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=1)
+
+    loop = maybe_use_uvloop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(
+            schedule_formatting(
+                sources=sources,
+                fast=fast,
+                write_back=write_back,
+                mode=mode,
+                report=report,
+                loop=loop,
+                executor=executor,
+                no_cache=no_cache,
+                cache_dir=cache_dir,
+            )
+        )
+    finally:
+        try:
+            shutdown(loop)
+        finally:
+            asyncio.set_event_loop(None)
+        if executor is not None:
+            executor.shutdown()
+
+
+def _is_tempdir_too_long_for_unix_sockets() -> bool:
+    """Return True if temp directory path is too long for Unix domain sockets.
+
+    On POSIX systems, Unix domain sockets created by multiprocessing.Manager()
+    must fit within sockaddr_un.sun_path (104 bytes on macOS/BSD, 108 bytes on Linux).
+    multiprocessing adds ~35 characters (/pymp-XXXXXXXX/listener-YYYYYYYY).
+    """
+    if sys.platform == "win32":
+        return False
+    else:
+        max_socket_path_length = 108 if sys.platform.startswith("linux") else 104
+        return len(tempfile.gettempdir()) + 35 >= max_socket_path_length
+
+
+async def schedule_formatting(
+    sources: set[Path],
+    fast: bool,
+    write_back: WriteBack,
+    mode: Mode,
+    report: Report,
+    loop: asyncio.AbstractEventLoop,
+    executor: Executor,
+    no_cache: bool = False,
+    cache_dir: Path | None = None,
+) -> None:
+    """Run formatting of `sources` in parallel using the provided `executor`.
+
+    (Use ProcessPoolExecutors for actual parallelism.)
+
+    `write_back`, `fast`, and `mode` options are passed to
+    :func:`format_file_in_place`.
+    """
+    if no_cache:
+        cache = None
+    elif cache_dir is None:
+        cache = Cache.read(mode)
+    else:
+        cache = Cache.read(mode, cache_dir)
+    if cache is not None:
+        sources, cached = cache.filtered_cached(sources)
+        for src in sorted(cached):
+            report.done(src, Changed.CACHED)
+    if not sources:
+        return
+
+    cancelled = []
+    sources_to_cache = []
+    lock = None
+    manager = None
+    if write_back in (WriteBack.DIFF, WriteBack.COLOR_DIFF):
+        # For diff output, we need locks to ensure we don't interleave output
+        # from different processes.
+        if _is_tempdir_too_long_for_unix_sockets():
+            err(
+                "Cannot start multiprocessing manager for --diff because the temporary"
+                " directory path is too long for Unix domain sockets (AF_UNIX path"
+                " limit). Please set TMPDIR to a shorter path."
+            )
+            sys.exit(1)
+
+        try:
+            manager = Manager()
+            lock = manager.Lock()
+        except (OSError, EOFError) as e:
+            err(
+                f"Cannot start multiprocessing manager for --diff: {e}. "
+                "Please set TMPDIR to a shorter path."
+            )
+            sys.exit(1)
+
+    try:
+        tasks = {
+            asyncio.ensure_future(
+                loop.run_in_executor(
+                    executor, format_file_in_place, src, fast, mode, write_back, lock
+                )
+            ): src
+            for src in sorted(sources)
+        }
+        pending = set(tasks)
+        try:
+            loop.add_signal_handler(signal.SIGINT, cancel, pending)
+            loop.add_signal_handler(signal.SIGTERM, cancel, pending)
+        except NotImplementedError:
+            # There are no good alternatives for these on Windows.
+            pass
+        # `asyncio.wait(..., return_when=FIRST_COMPLETED)` in a tight loop is
+        # quadratic in the number of files: every call re-registers completion
+        # callbacks on all pending tasks, so 10x the files means ~100x that
+        # bookkeeping (see #1951). A done callback per task costs O(1) per
+        # completion instead, and the queue preserves completion-order
+        # processing of results.
+        finished: asyncio.Queue[asyncio.Future[Any]] = asyncio.Queue()
+        for task in pending:
+            task.add_done_callback(finished.put_nowait)
+        while pending:
+            task = await finished.get()
+            pending.discard(task)
+            src = tasks.pop(task)
+            if task.cancelled():
+                cancelled.append(task)
+            elif exc := task.exception():
+                if report.verbose:
+                    traceback.print_exception(type(exc), exc, exc.__traceback__)
+                report.failed(src, exc)
+            else:
+                changed = Changed.YES if task.result() else Changed.NO
+                can_cache_unmodified = (
+                    write_back in (
+                        WriteBack.CHECK,
+                        WriteBack.DIFF,
+                        WriteBack.COLOR_DIFF,
+                    )
+                    and changed is Changed.NO
+                )
+                if write_back is WriteBack.YES or can_cache_unmodified:
+                    sources_to_cache.append(src)
+                report.done(src, changed)
+        if sources_to_cache and not no_cache and cache is not None:
+            cache.write(sources_to_cache)
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+            # Some files were never formatted, so don't report the run as a success.
+            raise KeyboardInterrupt
+    finally:
+        if manager is not None:
+            manager.shutdown()
