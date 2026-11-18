@@ -17,6 +17,11 @@ When combining `--skip-source-first-line` (`-x`) with `--line-ranges` (e.g. `--l
 
 ---
 
+## Solution Approach
+1. **Analyze Coordinate Shift with `--skip-source-first-line`:** When `--skip-source-first-line` strips line 1 (e.g. a non-Python shebang or magic line) before parsing, internal AST line numbers shift down by 1, but `--line-ranges` was still applied using the unshifted original line coordinates, causing an off-by-one formatting error.
+2. **Synchronize Line-Range Offset:** Adjusted the line range coordinates in `src/black/__init__.py` to account for the skipped first line before invoking the formatter, and restored alignment cleanly without mutating lines outside the requested range.
+3. **TDD & Regression Safety:** Added `test_skip_source_first_line_with_line_ranges` in `tests/test_black.py` verifying exact target lines are formatted when both flags are combined.
+
 ## Solution
 Implemented `_shift_lines_for_skipped_header()`:
 1. For each `(start, end)` tuple in `lines`, if `end <= 1`, the range lies entirely within the skipped header line and is discarded.
